@@ -281,19 +281,7 @@ class FeatureExtractor:
         )
 
     def _prepare(self, raw):
-        if abs(raw.info["sfreq"] - TARGET_SR) > 1:
-            raw.resample(TARGET_SR, verbose="ERROR")
-
-        iir_params = dict(order=4, ftype="butter", output="sos")
-        raw.filter(LOWCUT, HIGHCUT,
-                   method="iir", iir_params=iir_params,
-                   phase="zero", verbose="ERROR")
-
-        if USE_AVERAGE_REFERENCE:
-            eeg = [c for c in (_resolve_channel(raw, ch) for ch in self.channels) if c]
-            if len(eeg) > 1:
-                raw.set_eeg_reference(eeg, projection=False, verbose="ERROR")
-        return raw
+        return prepare_raw(raw)
 
     def _channel_features(self, segment: np.ndarray, sfreq: float, ch: str) -> dict:
         seg_uv = segment * 1e6
@@ -320,3 +308,22 @@ class FeatureExtractor:
         out[f"{ch}_dar"] = powers["delta"] / (powers["alpha"] or 1e-12)
         out[f"{ch}_se50"] = _se50(freqs, psd)
         return out
+
+def prepare_raw(raw):
+    """Публичная функция подготовки raw: resample + фильтр + референс.
+    Используется в FeatureExtractor._prepare и в SignalCache.
+    """
+    if abs(raw.info["sfreq"] - TARGET_SR) > 1:
+        raw.resample(TARGET_SR, verbose="ERROR")
+
+    iir_params = dict(order=4, ftype="butter", output="sos")
+    raw.filter(LOWCUT, HIGHCUT,
+               method="iir", iir_params=iir_params,
+               phase="zero", verbose="ERROR")
+
+    if USE_AVERAGE_REFERENCE:
+        eeg = [c for c in (_resolve_channel(raw, ch)
+                            for ch in STANDARD_CHANNELS) if c]
+        if len(eeg) > 1:
+            raw.set_eeg_reference(eeg, projection=False, verbose="ERROR")
+    return raw

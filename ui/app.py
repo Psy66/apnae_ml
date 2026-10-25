@@ -12,20 +12,22 @@ from ui.pages.page_results import page_results
 from ui.pages.page_logs import page_logs
 from ui.pages.page_settings import page_settings
 from ui.pages.page_about import page_about
+from ui.pages.page_signal_viewer import page_signal_viewer
 
 
 def create_layout():
     with ui.header().classes("bg-blue-8 text-white items-center"):
         ui.label("🧠 APNEA-ML").classes("text-xl font-bold")
         ui.space()
-        busy_badge()                                       # ← индикатор
+        busy_badge()
         ui.space()
         with ui.row().classes("gap-2"):
-            guarded_link("ℹ О проекте", "/about")          # ← вместо ui.link
+            guarded_link("ℹ О проекте", "/about")
             guarded_link("⚙ Settings", "/settings")
             guarded_link("1. Download", "/download")
             guarded_link("2. Extract", "/extract")
             guarded_link("3. Experiments", "/experiments")
+            guarded_link("🔬 Сигналы", "/signals")
             guarded_link("4. Results", "/results")
             guarded_link("📋 Logs", "/logs")
 
@@ -56,7 +58,7 @@ ui.page("/extract")(page_extract)
 ui.page("/experiments")(page_experiments)
 ui.page("/results")(page_results)
 ui.page("/logs")(page_logs)
-
+ui.page("/signals")(page_signal_viewer)
 
 def start_app():
     state.init_api()
