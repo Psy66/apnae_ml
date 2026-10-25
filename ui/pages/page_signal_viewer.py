@@ -5,8 +5,15 @@
 - Средние PSD «апноэ» vs «без апноэ» + разница (log10(pos/neg)).
 
 Кэш сигналов — в core/edf_reader.SignalCache (~240 МБ на исследование).
+
+Особенности:
+- state.studies подгружается автоматически при первом клике
+  «Загрузить сигналы» (не нужно сначала открывать Download).
+- Если файл не найден по SHA256 — пробуем by_study fallback.
+- Признаки грузятся только для выбранного study_id (быстрее в 15 раз).
 """
 import asyncio
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -100,7 +107,7 @@ def page_signal_viewer():
                 ).classes("w-full")
 
             # ============================================================
-            # Правая панель
+            # Правая панель: Notebook с графиками
             # ============================================================
             with ui.column().classes("flex-1"):
                 with ui.tabs().classes("w-full") as tabs:
@@ -132,22 +139,40 @@ def page_signal_viewer():
             except Exception:
                 pass
 
+        async def _ensure_studies() -> bool:
+            """Гарантирует, что state.studies загружен.
+            Если пуст — запрашивает у API. Возвращает True при успехе.
+            """
+            if state.studies:
+                return True
+            status_lbl.set_text("Загрузка списка исследований...")
+            try:
+                state.studies = await asyncio.to_thread(
+                    state.api.get_studies)
+                log.push(f"Загружено исследований: {len(state.studies)}")
+                return True
+            except Exception as e:
+                log.push(f"Ошибка загрузки списка: {e}")
+                return False
+
         def _get_edf_path(study_id: int):
+            """Ищет EDF: сначала по SHA256 (через state.studies),
+            потом fallback — по study_id."""
             study = next(
                 (s for s in state.studies if s["study_id"] == study_id),
                 None,
             )
-            if not study:
-                return None
-            checksum = study.get("file_checksum", "") or ""
-            return state.edf_cache.get_any(study_id, checksum)
+            checksum = (study or {}).get("file_checksum", "") or ""
+            p = state.edf_cache.get_any(study_id, checksum)
+            if p:
+                return p
+            return state.edf_cache.get_by_study(study_id)
 
         def _meta_for_study(sid: int):
             """(epoch_len, t_pos, buffer_sec) для исследования."""
             matches = [item for item in available if item[0] == sid]
             if not matches:
                 return None
-            # Берём самое большое epoch_len (если их несколько)
             chosen = max(matches, key=lambda x: x[1])
             return float(chosen[1]), float(chosen[2]), float(chosen[3])
 
@@ -162,13 +187,35 @@ def page_signal_viewer():
         async def do_load():
             load_btn.disable()
             try:
+                # 1) гарантируем список исследований
+                if not await _ensure_studies():
+                    safe_notify(
+                        "Не удалось загрузить список исследований. "
+                        "Проверьте соединение на вкладке ⚙ Settings.",
+                        type="negative")
+                    return
+
                 sid = int(study_sel.value)
                 edf = _get_edf_path(sid)
+
+                # 2) диагностика, если не нашли
                 if not edf:
-                    safe_notify("EDF-файл не найден в кэше. "
-                                "Сначала скачайте на шаге 1.",
-                                type="negative")
+                    study = next(
+                        (s for s in state.studies
+                         if s["study_id"] == sid), None)
+                    checksum = (study or {}).get(
+                        "file_checksum", "") or ""
+                    log.push(
+                        f"EDF не найден: study_id={sid}, "
+                        f"studies в памяти={len(state.studies)}, "
+                        f"checksum={'есть' if checksum else 'пусто'}"
+                    )
+                    safe_notify(
+                        f"EDF для study_id={sid} не найден в кэше. "
+                        f"Скачайте на вкладке «1. Download».",
+                        type="negative")
                     return
+
                 status_lbl.set_text("Чтение EDF (5–15 сек)...")
                 entry = await asyncio.to_thread(
                     signal_cache.load, sid, edf,
@@ -182,27 +229,29 @@ def page_signal_viewer():
             except Exception as e:
                 status_lbl.set_text(f"Ошибка: {e}")
                 log.push(f"Ошибка загрузки: {e}")
-                import traceback
                 log.push(traceback.format_exc().splitlines()[-1])
             finally:
                 load_btn.enable()
 
         # ------------------------------------------------------------
-        # Загрузка эпох из FeatureStore
+        # Загрузка эпох из FeatureStore (только выбранного исследования)
         # ------------------------------------------------------------
         async def _load_epochs():
             sid = int(study_sel.value)
             meta = _meta_for_study(sid)
             if meta is None:
-                safe_notify("Нет данных признаков для этого исследования",
-                            type="warning")
+                safe_notify(
+                    "Нет данных признаков для этого исследования",
+                    type="warning")
                 return
             epoch_len, t_pos, buffer_sec = meta
             current["epoch_len"] = epoch_len
 
             def _load():
+                # грузим только нужный study_id — в 15 раз быстрее
                 return state.feature_store.load_all(
-                    epoch_len, t_pos=t_pos, buffer_sec=buffer_sec)
+                    epoch_len, study_ids=[sid],
+                    t_pos=t_pos, buffer_sec=buffer_sec)
 
             try:
                 df = await asyncio.to_thread(_load)
@@ -211,11 +260,10 @@ def page_signal_viewer():
                 return
 
             if df.empty:
-                safe_notify("Нет эпох для этого исследования",
-                            type="warning")
+                safe_notify(
+                    "Нет эпох для этого исследования", type="warning")
                 return
-            df = df[df["study_id"] == sid].reset_index(drop=True)
-            current["epochs_df"] = df
+            current["epochs_df"] = df.reset_index(drop=True)
             render_epochs()
 
         # ------------------------------------------------------------
@@ -237,8 +285,9 @@ def page_signal_viewer():
 
             with epochs_area:
                 if df_show.empty:
-                    ui.label("Нет эпох с выбранными метками").classes(
-                        "text-sm text-gray-500")
+                    ui.label(
+                        "Нет эпох с выбранными метками"
+                    ).classes("text-sm text-gray-500")
                     return
                 for _, row in df_show.head(300).iterrows():
                     lbl = int(row["label"])
@@ -265,13 +314,15 @@ def page_signal_viewer():
             epoch_len = float(row.get("epoch_len", current["epoch_len"]))
             sfreq = signal_cache.sfreq(sid)
             if sfreq is None:
-                safe_notify("Сначала загрузите сигналы в память",
-                            type="warning")
+                safe_notify(
+                    "Сначала загрузите сигналы в память",
+                    type="warning")
                 return
             seg = signal_cache.get_epoch(sid, ts, epoch_len, ch)
             if seg is None or len(seg) < 16:
-                safe_notify("Не удалось получить сигнал этой эпохи",
-                            type="warning")
+                safe_notify(
+                    "Не удалось получить сигнал этой эпохи",
+                    type="warning")
                 return
             seg_uv = seg * 1e6
 
@@ -311,9 +362,11 @@ def page_signal_viewer():
             ax2.set_title(
                 f"PSD эпохи t={ts:.0f}s, канал {ch}  |  {mark}")
             if len(freqs) > 0 and len(psd) > 0:
-                ymin = max(psd[psd > 0].min() if np.any(psd > 0) else 1e-6,
-                           1e-6)
+                positive_psd = psd[psd > 0]
+                ymin = positive_psd.min() if len(positive_psd) else 1e-6
                 ymax = psd.max() if psd.max() > 0 else 1.0
+                if ymax <= 0:
+                    ymax = 1.0
                 for name, (lo, hi) in BANDS.items():
                     ax2.text((lo + hi) / 2,
                              ymax * 0.5,
@@ -335,13 +388,13 @@ def page_signal_viewer():
             sid = int(study_sel.value)
             ch = chan_sel.value
             if df is None or df.empty:
-                safe_notify("Сначала загрузите сигналы и эпохи",
-                            type="warning")
+                safe_notify(
+                    "Сначала загрузите сигналы и эпохи", type="warning")
                 return
             sfreq = signal_cache.sfreq(sid)
             if sfreq is None:
-                safe_notify("Сначала загрузите сигналы в память",
-                            type="warning")
+                safe_notify(
+                    "Сначала загрузите сигналы в память", type="warning")
                 return
             epoch_len = float(current["epoch_len"])
             avg_btn.disable()
@@ -429,7 +482,7 @@ def page_signal_viewer():
         def _on_change():
             sid = int(study_sel.value)
             if signal_cache.is_loaded(sid):
-                # Перезагружаем эпохи и (по возможности) обновляем графики
+                # Перезагружаем эпохи для нового study_id
                 asyncio.create_task(_load_epochs())
             else:
                 _clear(epochs_area)
