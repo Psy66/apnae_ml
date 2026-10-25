@@ -1,26 +1,33 @@
-"""Normalizer: fit on train, transform train/test.
+"""Normalizer + строгий отбор признаков.
 
-Для patient-z используется трансдуктивный подход: для КАЖДОГО пациента
-(включая test) μ/σ считаются по его собственным тоническим эпохам.
-Это НЕ утечка меток (используем только сигнал, не label) и корректно
-воспроизводит deployment: для нового пациента в клинике тоже есть
-только его собственный сигнал.
+Признаки ЭЭГ определяются ЯВНО по префиксам каналов. Всё остальное
+(клинические, метаданные, разметка) — игнорируется. Это защита от
+случайного попадания в X_train клинических колонок с NaN.
 """
 from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-META_COLS = {
-    "study_id", "patient_id", "epoch_start", "epoch_len", "epoch_stage",
-    "label", "overlap_fraction", "n_events", "has_event_onset",
-    "has_event_offset", "is_tonic", "artifact_overlap_sec", "ahi",
-    "cvd_hypertension", "endocrine_diabetes", "som_insomnia", "cvd_ihd",
-}
+# Явный список префиксов ЭЭГ-признаков (по 6 каналам + когерентность)
+CHANNEL_PREFIXES = ("F3_", "C3_", "O1_", "F4_", "C4_", "O2_")
+COHERENCE_PREFIXES = ("F3C3_", "F3F4_", "F3C4_", "C3C4_",
+                      "C3O1_", "F4C4_", "O1O2_", "C3O2_")
 
 
 def identify_feature_columns(df: pd.DataFrame) -> list:
-    return [c for c in df.columns
-            if c not in META_COLS and pd.api.types.is_numeric_dtype(df[c])]
+    """Возвращает только ЭЭГ-признаки (спектральные + когерентность).
+
+    Клинические/метаданные колонки (bmi, age_at_study, neuro_*,
+    meds_*, scale_*, lab_*, gender_code, ...) автоматически исключены,
+    потому что не начинаются с префиксов каналов.
+    """
+    out = []
+    for c in df.columns:
+        if not pd.api.types.is_numeric_dtype(df[c]):
+            continue
+        if c.startswith(CHANNEL_PREFIXES) or c.startswith(COHERENCE_PREFIXES):
+            out.append(c)
+    return out
 
 
 class Normalizer:
@@ -33,7 +40,7 @@ class Normalizer:
       — fallback на глобальные μ/σ (для train и test одинаково).
     """
 
-    MIN_TONIC = 20  # минимум тонических эпох для надёжной per-patient нормы
+    MIN_TONIC = 20
 
     def __init__(self, method: str = "patient"):
         self.method = method
@@ -61,12 +68,12 @@ class Normalizer:
 
         if self.method == "global":
             df[feature_cols] = (
-                    (df[feature_cols].values - self._global_stats["mean"])
-                    / self._global_stats["std"]
+                (df[feature_cols].values - self._global_stats["mean"])
+                / self._global_stats["std"]
             )
             return df
 
-        # patient — для КАЖДОГО пациента отдельно
+        # patient — для каждого пациента отдельно
         X = df[feature_cols].values.astype(float)
         g_mean = self._global_stats["mean"]
         g_std = self._global_stats["std"]
@@ -82,11 +89,11 @@ class Normalizer:
                 baseline_idx = idx
 
             if len(baseline_idx) >= 2:
-                # nanmean / nanstd с "safe" выходом
-                m = np.nanmean(X[baseline_idx], axis=0)
-                s = np.nanstd(X[baseline_idx], axis=0)
-                # Если mean/std получились NaN (все значения были NaN),
-                # или std = 0 — подменяем глобальными
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    m = np.nanmean(X[baseline_idx], axis=0)
+                    s = np.nanstd(X[baseline_idx], axis=0)
+                # Если nanmean/nanstd вернули NaN (все значения NaN)
+                # или std = 0 → подменяем глобальными/единицей
                 m = np.where(np.isnan(m), g_mean, m)
                 s = np.where(np.isnan(s) | (s == 0), 1.0, s)
             else:

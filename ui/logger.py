@@ -17,7 +17,8 @@ class SafeLog:
         self._widget = widget
 
     def push(self, msg: str) -> None:
-        # НЕ logger.info, потому что вызывающий сам логирует (progress_cb)
+        """Пишет в UI + буфер. В файл — только через вызывающий код
+        (progress_cb → logger.info), чтобы не дублировать строки."""
         try:
             from ui.state import state
             ts = datetime.now().strftime("%H:%M:%S")

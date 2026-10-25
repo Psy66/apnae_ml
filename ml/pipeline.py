@@ -1,6 +1,14 @@
 """Полный ML-пайплайн: диагностика → split → CV → fit → eval → сохранение.
 
 Особенности:
+- Мягкий фильтр prevalence пациентов (2%–98%) для борьбы с «пациент vs
+  эпоха»: контрольные и extreme-severe пациенты с prevalence <2% или >98%
+  исключаются, чтобы модель училась на признаках эпохи.
+- identify_feature_columns() берёт ТОЛЬКО ЭЭГ-признаки (по префиксам
+  каналов F3_/C3_/.../O2_ и когерентности F3C3_/...). Клинические поля
+  (bmi, neuro_*, meds_*) в X не попадают — они служат только для фильтров.
+- nan_to_num после нормализации — защита от NaN/Inf, которые могут
+  появляться в редких вырожденных эпохах.
 - Адаптивное число CV-фолдов (не падает при <5 пациентах в train).
 - Диагностика распределения positive-эпох по пациентам (train/test).
 - Per-patient AUC на test (для понимания, не «утягивает» ли результат
@@ -11,6 +19,7 @@
   на train.
 """
 from __future__ import annotations
+
 import json
 import logging
 from dataclasses import dataclass, field, asdict
@@ -55,6 +64,13 @@ _QUALITY_ORDER = {
     "unusable": 0,
 }
 
+# Мягкие границы prevalence пациентов. Контроль (0% positive) и extreme-
+# severe (100% positive) исключаются: модель иначе выучит «пациента»,
+# а не «апноэ». 2%–98% оставляет пациентов со смешанными эпохами.
+_PREV_MIN = 0.02
+_PREV_MAX = 0.98
+_PREV_MIN_PATIENTS_LEFT = 5
+
 
 def _apply_comorbidity_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
     """Применяет фильтры к df.
@@ -75,7 +91,6 @@ def _apply_comorbidity_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
                 df = df[df[col] == 1]
             elif val == "only_negative":
                 df = df[df[col] == 0]
-            # "ignore" — ничего не делаем
             continue
 
         # --- Числовой диапазон ---
@@ -99,30 +114,42 @@ def _apply_comorbidity_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
         if isinstance(val, dict) and "quality_min" in val:
             min_q = val["quality_min"]
             min_order = _QUALITY_ORDER.get(min_q, 3)
-            df = df[df[col].map(lambda x: _QUALITY_ORDER.get(x, 0) >= min_order)]
+            df = df[df[col].map(
+                lambda x: _QUALITY_ORDER.get(x, 0) >= min_order)]
             continue
 
     return df
 
 
 def _prepare(df: pd.DataFrame, cfg: ExperimentConfig) -> pd.DataFrame:
+    """Базовая фильтрация + мягкий фильтр prevalence пациентов.
+
+    1. Берём только эпохи с label ∈ {0, 1} (discard = -1 отбрасывается).
+    2. Применяем клинические фильтры (если заданы).
+    3. Исключаем пациентов с prevalence <2% или >98% positive — контроль
+       и extreme-severe. Иначе модель учится на «пациент vs пациент»,
+       а не на «эпоха с апноэ vs без».
+
+    Фильтр prevalence применяется ТОЛЬКО если после него остаётся
+    ≥ _PREV_MIN_PATIENTS_LEFT пациентов. Иначе — не фильтруем, чтобы
+    не получить пустой датасет.
+    """
     df = df[df["label"].isin([0, 1])].copy()
+    if df.empty:
+        return df
+
     if cfg.comorbidity_filters:
         df = _apply_comorbidity_filters(df, cfg.comorbidity_filters)
+        if df.empty:
+            return df
 
-    # --- исключаем пациентов с экстремальным prevalence ---
-    # Пациенты, у которых <5% или >95% positive — «слишком лёгкие» или
-    # «слишком тяжёлые», модель выучит «пациента», а не «апноэ»
-    MIN_PREVALENCE = 0.05
-    MAX_PREVALENCE = 0.95
-    patient_prev = df.groupby("patient_id")["label"].mean()
-    keep_patients = patient_prev[
-        (patient_prev >= MIN_PREVALENCE) & (patient_prev <= MAX_PREVALENCE)
+    # --- Фильтр prevalence ---
+    prev = df.groupby("patient_id")["label"].mean()
+    keep_patients = prev[
+        (prev >= _PREV_MIN) & (prev <= _PREV_MAX)
     ].index
-    if len(keep_patients) < 5:
-        # Если слишком мало осталось — не фильтруем, но предупреждаем
-        pass
-    else:
+
+    if len(keep_patients) >= _PREV_MIN_PATIENTS_LEFT:
         df = df[df["patient_id"].isin(keep_patients)].copy()
 
     return df
@@ -139,6 +166,7 @@ def _get_target(df: pd.DataFrame, target: str) -> np.ndarray:
 
 
 def _compute_shap_importance(model, X_sample, feature_names, top_n=20):
+    """Топ-N признаков по среднему |SHAP|. Возвращает [] при ошибке."""
     try:
         import shap
         explainer = shap.TreeExplainer(model)
@@ -215,10 +243,9 @@ def _diagnose_split(df_train: pd.DataFrame, df_test: pd.DataFrame,
     if any(r["pos"] == r["n"] for r in test_d):
         full = [r["patient_id"] for r in test_d if r["pos"] == r["n"]]
         warnings.append(
-            f"⚠ В test {len(full)} пациент(ов) со ВСЕМИ positive-эпохами: {full}. "
-            f"Возможно, у них нет тонических эпох N2/N3."
+            f"⚠ В test {len(full)} пациент(ов) со ВСЕМИ positive-эпохами: "
+            f"{full}. Возможно, у них нет тонических эпох N2/N3."
         )
-    # Разброс prevalence в train
     if train_d:
         prevs = [r["prev"] for r in train_d]
         if max(prevs) - min(prevs) > 0.7:
@@ -232,12 +259,12 @@ def _diagnose_split(df_train: pd.DataFrame, df_test: pd.DataFrame,
     for r in train_d:
         progress(f"  pid={r['patient_id']:>4} | "
                  f"{r['pos']:>5}/{r['n']:>5} positive "
-                 f"({r['prev']*100:>5.1f}%)")
+                 f"({r['prev'] * 100:>5.1f}%)")
     progress("=== Диагностика test ===")
     for r in test_d:
         progress(f"  pid={r['patient_id']:>4} | "
                  f"{r['pos']:>5}/{r['n']:>5} positive "
-                 f"({r['prev']*100:>5.1f}%)")
+                 f"({r['prev'] * 100:>5.1f}%)")
     for w in warnings:
         progress(w)
 
@@ -250,15 +277,39 @@ def run_experiment(df: pd.DataFrame, cfg: ExperimentConfig,
                    progress_cb=None) -> dict:
     """Единичный эксперимент. Возвращает dict с метриками и диагностикой."""
     def progress(msg):
+        # лог в файл
         logger.info(msg)
+        # лог в UI (если задан callback)
         if progress_cb:
             progress_cb(msg)
 
+    # --- Запоминаем исходные размеры для диагностики фильтра ---
+    n_before = len(df)
+    p_before = df["patient_id"].nunique() if "patient_id" in df else 0
+
     df = _prepare(df, cfg)
     if df.empty:
-        raise ValueError("После фильтрации не осталось данных")
+        raise ValueError(
+            "После фильтрации не осталось данных. "
+            "Проверьте клинические фильтры или порог prevalence."
+        )
 
+    n_after = len(df)
+    p_after = df["patient_id"].nunique()
+    if p_before != p_after or n_before != n_after:
+        progress(
+            f"⚠ Фильтр prevalence ({_PREV_MIN:.0%}–{_PREV_MAX:.0%}): "
+            f"пациентов {p_before}→{p_after}, эпох {n_before}→{n_after}"
+        )
+
+    # --- Отбор ТОЛЬКО ЭЭГ-признаков (см. normalization.identify_feature_columns) ---
     feature_cols = identify_feature_columns(df)
+    if not feature_cols:
+        raise ValueError(
+            "Не найдено ЭЭГ-признаков (ожидались колонки F3_*, C3_*, ..., "
+            "O2_* или *C*_coh_*). Проверьте извлечение признаков."
+        )
+
     y = _get_target(df, cfg.target)
     if len(np.unique(y)) < 2:
         raise ValueError(
@@ -269,8 +320,9 @@ def run_experiment(df: pd.DataFrame, cfg: ExperimentConfig,
     patients = np.unique(groups)
 
     progress(f"Данные: {len(df)} эпох, {len(patients)} пациентов, "
-             f"{len(feature_cols)} признаков")
-    progress(f"Баланс: {int(y.sum())} positive / {int((1 - y).sum())} negative")
+             f"{len(feature_cols)} ЭЭГ-признаков")
+    progress(f"Баланс: {int(y.sum())} positive / "
+             f"{int((1 - y).sum())} negative")
 
     if len(patients) < 10:
         progress(
@@ -279,7 +331,7 @@ def run_experiment(df: pd.DataFrame, cfg: ExperimentConfig,
             f"≥50 (статья). Результаты ниже — только smoke-test пайплайна."
         )
 
-    # --- Стратификация по пациентам по «уровню» prevalence ---
+    # --- Стратификация по пациентам по уровню prevalence ---
     pat_label = (df.groupby("patient_id")["label"].mean() > 0.1).astype(int)
     pat_label = pat_label.loc[patients].values
 
@@ -306,9 +358,17 @@ def run_experiment(df: pd.DataFrame, cfg: ExperimentConfig,
     df_train_n = normalizer.transform(df_train, feature_cols)
     df_test_n = normalizer.transform(df_test, feature_cols)
 
+    X_train = df_train_n[feature_cols].values.astype(float)
+    X_test = df_test_n[feature_cols].values.astype(float)
+    groups_train = df_train["patient_id"].values
+
+    # --- ФИКС: NaN / inf → 0 (гарантия, что sklearn не упадёт) ---
+    n_nan_before = int(np.isnan(X_train).sum() + np.isnan(X_test).sum())
+    if n_nan_before > 0:
+        progress(f"⚠ Обнаружено {n_nan_before} NaN/Inf в X после "
+                 f"нормализации — заменяем нулями")
     X_train = np.nan_to_num(X_train, nan=0.0, posinf=0.0, neginf=0.0)
     X_test = np.nan_to_num(X_test, nan=0.0, posinf=0.0, neginf=0.0)
-    groups_train = df_train["patient_id"].values
 
     # --- Адаптивный CV ---
     n_train_patients = len(np.unique(groups_train))
@@ -324,6 +384,14 @@ def run_experiment(df: pd.DataFrame, cfg: ExperimentConfig,
         "n_test_patients": len(test_patients),
         "class_balance": {"pos": int(y.sum()), "neg": int((1 - y).sum())},
         "features": feature_cols,
+        "prevalence_filter": {
+            "before_patients": int(p_before),
+            "after_patients": int(p_after),
+            "before_epochs": int(n_before),
+            "after_epochs": int(n_after),
+            "min_threshold": _PREV_MIN,
+            "max_threshold": _PREV_MAX,
+        },
         "diagnostics": diag,
         "models": {},
         "timestamp": datetime.now().isoformat(),
@@ -332,7 +400,7 @@ def run_experiment(df: pd.DataFrame, cfg: ExperimentConfig,
     for model_name in cfg.models:
         progress(f"→ {model_name}")
         try:
-            # --- CV с адаптивным числом фолдов ---
+            # --- CV ---
             cv_aucs = []
             if n_folds_eff >= 2:
                 if n_folds_eff < cfg.n_folds:
@@ -439,8 +507,8 @@ def run_comparison(df: pd.DataFrame, base_cfg: ExperimentConfig,
                    progress_cb=None) -> dict:
     """Сравнивает нормализации на ОДНОМ и том же split-е.
 
-    Важно: используется одинаковый random_state, поэтому train/test
-    одинаковы для всех нормализаций — сравнение честное.
+    Используется одинаковый random_state → train/test одинаковы для всех
+    нормализаций → сравнение честное.
     """
     def progress(msg):
         logger.info(msg)
@@ -501,7 +569,6 @@ def load_experiment(path: Path) -> dict:
 def list_experiments(experiments_dir: Path) -> list:
     if not Path(experiments_dir).exists():
         return []
-    # Исключаем COMPARISON_* из общего списка
     return sorted(
         [p for p in Path(experiments_dir).glob("*.json")
          if not p.name.startswith("COMPARISON_")],
