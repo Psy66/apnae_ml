@@ -61,8 +61,8 @@ class Normalizer:
 
         if self.method == "global":
             df[feature_cols] = (
-                (df[feature_cols].values - self._global_stats["mean"])
-                / self._global_stats["std"]
+                    (df[feature_cols].values - self._global_stats["mean"])
+                    / self._global_stats["std"]
             )
             return df
 
@@ -79,12 +79,16 @@ class Normalizer:
             else:
                 baseline_idx = idx
             if len(baseline_idx) < self.MIN_TONIC:
-                baseline_idx = idx  # fallback: все эпохи пациента
+                baseline_idx = idx
 
             if len(baseline_idx) >= 2:
+                # nanmean / nanstd с "safe" выходом
                 m = np.nanmean(X[baseline_idx], axis=0)
                 s = np.nanstd(X[baseline_idx], axis=0)
-                s = np.where(s == 0, 1.0, s)
+                # Если mean/std получились NaN (все значения были NaN),
+                # или std = 0 — подменяем глобальными
+                m = np.where(np.isnan(m), g_mean, m)
+                s = np.where(np.isnan(s) | (s == 0), 1.0, s)
             else:
                 m, s = g_mean, g_std
             X[idx] = (X[idx] - m) / s

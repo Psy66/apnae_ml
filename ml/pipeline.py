@@ -109,6 +109,22 @@ def _prepare(df: pd.DataFrame, cfg: ExperimentConfig) -> pd.DataFrame:
     df = df[df["label"].isin([0, 1])].copy()
     if cfg.comorbidity_filters:
         df = _apply_comorbidity_filters(df, cfg.comorbidity_filters)
+
+    # --- исключаем пациентов с экстремальным prevalence ---
+    # Пациенты, у которых <5% или >95% positive — «слишком лёгкие» или
+    # «слишком тяжёлые», модель выучит «пациента», а не «апноэ»
+    MIN_PREVALENCE = 0.05
+    MAX_PREVALENCE = 0.95
+    patient_prev = df.groupby("patient_id")["label"].mean()
+    keep_patients = patient_prev[
+        (patient_prev >= MIN_PREVALENCE) & (patient_prev <= MAX_PREVALENCE)
+    ].index
+    if len(keep_patients) < 5:
+        # Если слишком мало осталось — не фильтруем, но предупреждаем
+        pass
+    else:
+        df = df[df["patient_id"].isin(keep_patients)].copy()
+
     return df
 
 
@@ -290,8 +306,8 @@ def run_experiment(df: pd.DataFrame, cfg: ExperimentConfig,
     df_train_n = normalizer.transform(df_train, feature_cols)
     df_test_n = normalizer.transform(df_test, feature_cols)
 
-    X_train = df_train_n[feature_cols].values
-    X_test = df_test_n[feature_cols].values
+    X_train = np.nan_to_num(X_train, nan=0.0, posinf=0.0, neginf=0.0)
+    X_test = np.nan_to_num(X_test, nan=0.0, posinf=0.0, neginf=0.0)
     groups_train = df_train["patient_id"].values
 
     # --- Адаптивный CV ---

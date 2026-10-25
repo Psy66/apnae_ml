@@ -17,15 +17,13 @@ class SafeLog:
         self._widget = widget
 
     def push(self, msg: str) -> None:
-        logger.info(msg)
-        # 1) всегда в глобальный буфер
+        # НЕ logger.info, потому что вызывающий сам логирует (progress_cb)
         try:
             from ui.state import state
             ts = datetime.now().strftime("%H:%M:%S")
             state.append_busy_log(f"[{ts}] {msg}")
         except Exception:
             pass
-        # 2) в UI-виджет, если он ещё жив
         try:
             ts = datetime.now().strftime("%H:%M:%S")
             self._widget.push(f"[{ts}] {msg}")
