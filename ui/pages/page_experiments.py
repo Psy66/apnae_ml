@@ -797,8 +797,8 @@ def page_experiments():
                     lambda msg: log.push(msg))
 
                 state.set_busy_progress(0.9, "формирование отчёта")
-                report_path = (state.config.experiments_dir /
-                               f"{cfg.name}_report.html")
+                # Уникальное имя HTML — по имени JSON (с timestamp)
+                report_path = Path(results["_path"]).with_suffix(".html")
                 generate_report(results, str(report_path))
                 state.set_busy_progress(1.0, "готово")
 
