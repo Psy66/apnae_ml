@@ -47,14 +47,61 @@ class ExperimentConfig:
 
 
 # ---------------------------------------------------------------- helpers
+_QUALITY_ORDER = {
+    "excellent": 4,
+    "good": 3,
+    "fair": 2,
+    "poor": 1,
+    "unusable": 0,
+}
+
+
 def _apply_comorbidity_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
+    """Применяет фильтры к df.
+
+    Поддерживает 3 типа значений в filters:
+    - строка "only_positive" | "only_negative" | "ignore" → бинарные
+    - tuple (lo, hi) → числовой диапазон (None = без границы)
+    - dict {"enum_in": [...]} → список допустимых enum-значений
+    - dict {"quality_min": "good"} → минимальное качество (для rec_quality)
+    """
     for col, val in filters.items():
         if col not in df.columns:
             continue
-        if val == "only_positive":
-            df = df[df[col] == 1]
-        elif val == "only_negative":
-            df = df[df[col] == 0]
+
+        # --- Бинарный фильтр ---
+        if isinstance(val, str):
+            if val == "only_positive":
+                df = df[df[col] == 1]
+            elif val == "only_negative":
+                df = df[df[col] == 0]
+            # "ignore" — ничего не делаем
+            continue
+
+        # --- Числовой диапазон ---
+        if isinstance(val, (tuple, list)) and len(val) == 2:
+            lo, hi = val
+            num_col = pd.to_numeric(df[col], errors="coerce")
+            if lo is not None:
+                df = df[num_col >= lo]
+                num_col = num_col.loc[df.index]
+            if hi is not None:
+                df = df[num_col <= hi]
+            continue
+
+        # --- Enum: список допустимых значений ---
+        if isinstance(val, dict) and "enum_in" in val:
+            allowed = val["enum_in"]
+            df = df[df[col].isin(allowed)]
+            continue
+
+        # --- Качество записи: минимальный уровень ---
+        if isinstance(val, dict) and "quality_min" in val:
+            min_q = val["quality_min"]
+            min_order = _QUALITY_ORDER.get(min_q, 3)
+            df = df[df[col].map(lambda x: _QUALITY_ORDER.get(x, 0) >= min_order)]
+            continue
+
     return df
 
 
