@@ -11,8 +11,15 @@
   «Загрузить сигналы» (не нужно сначала открывать Download).
 - Если файл не найден по SHA256 — пробуем by_study fallback.
 - Признаки грузятся только для выбранного study_id (быстрее в 15 раз).
+
+ВАЖНО: в NiceGUI >= 2.x `ui.pyplot()` — это context-manager и НЕ
+принимает готовый matplotlib Figure. Поэтому все фигуры конвертируем
+в base64 PNG и показываем через `ui.image`. Это работает на любой
+версии NiceGUI (тот же приём, что в ml/report.py).
 """
 import asyncio
+import base64
+import io
 import traceback
 from pathlib import Path
 
@@ -39,7 +46,45 @@ BAND_LABELS = {
     "sigma": "σ 12–15", "beta": "β 15–30", "gamma": "γ 30–45",
 }
 
+# ASCII-метки для заголовков графиков. Эмодзи (✅ ❌ ⚠️) в DejaVu Sans
+# отсутствуют — matplotlib ругается UserWarning и рисует «тофу».
+# В ui.button / ui.label эмодзи работают, поэтому там оставляем как было.
+LABEL_ASCII = {1: "POSITIVE", 0: "NEGATIVE", -1: "DISCARD"}
+LABEL_EMOJI = {1: "✅", 0: "❌", -1: "⚠️"}
 
+
+# ---------------------------------------------------------------- helpers
+def _fig_to_b64(fig, dpi: int = 110) -> str:
+    """matplotlib Figure → base64-строка PNG. Закрывает фигуру."""
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode("utf-8")
+
+
+def _show_fig(container, fig, dpi: int = 110) -> None:
+    """Показать готовую matplotlib-фигуру внутри NiceGUI-контейнера.
+
+    Замена ui.pyplot(fig): в NiceGUI >= 2.x Pyplot — это context-manager
+    и не принимает готовый Figure. Конвертируем в PNG и показываем
+    через ui.image (тот же приём, что в ml/report.py).
+    """
+    try:
+        b64 = _fig_to_b64(fig, dpi=dpi)
+        with container:
+            ui.image(f"data:image/png;base64,{b64}").classes("w-full")
+    except Exception as e:
+        # Если контейнер уже удалён (клиент ушёл со страницы) —
+        # не валим весь обработчик.
+        try:
+            plt.close(fig)
+        except Exception:
+            pass
+        print(f"[signal_viewer] _show_fig failed: {e}")
+
+
+# ---------------------------------------------------------------- page
 def page_signal_viewer():
     from ui.app import create_layout
     create_layout()
@@ -291,7 +336,7 @@ def page_signal_viewer():
                     return
                 for _, row in df_show.head(300).iterrows():
                     lbl = int(row["label"])
-                    mark = {1: "✅", 0: "❌", -1: "⚠️"}.get(lbl, "?")
+                    mark = LABEL_EMOJI.get(lbl, "?")
                     ts = float(row["epoch_start"])
                     ov = float(row.get("overlap_fraction", 0.0))
                     btn = ui.button(
@@ -327,8 +372,8 @@ def page_signal_viewer():
             seg_uv = seg * 1e6
 
             lbl = int(row["label"])
-            mark = {1: "✅ positive", 0: "❌ negative",
-                    -1: "⚠️ discard"}.get(lbl, "?")
+            # ASCII-метка для заголовков графиков (эмодзи → «тофу»).
+            mark_plot = LABEL_ASCII.get(lbl, "?")
             ov = float(row.get("overlap_fraction", 0.0))
 
             # --- Волновая форма ---
@@ -339,14 +384,12 @@ def page_signal_viewer():
             ax.set_xlabel("Время, сек")
             ax.set_ylabel("Амплитуда, мкВ")
             ax.set_title(
-                f"{ch}  |  эпоха {ts:.0f}–{ts + epoch_len:.0f} с  |  "
-                f"{mark}  |  overlap={ov:.2f}"
+                f"{ch}  |  эпоха {ts:.0f}-{ts + epoch_len:.0f} с  |  "
+                f"{mark_plot}  |  overlap={ov:.2f}"
             )
             ax.grid(alpha=0.3)
             fig.tight_layout()
-            with wave_area:
-                ui.pyplot(fig)
-            plt.close(fig)
+            _show_fig(wave_area, fig)
 
             # --- PSD эпохи ---
             _clear(psd_area)
@@ -360,7 +403,7 @@ def page_signal_viewer():
             ax2.set_xlabel("Частота, Гц")
             ax2.set_ylabel("PSD, мкВ²/Гц (log)")
             ax2.set_title(
-                f"PSD эпохи t={ts:.0f}s, канал {ch}  |  {mark}")
+                f"PSD эпохи t={ts:.0f}s, канал {ch}  |  {mark_plot}")
             if len(freqs) > 0 and len(psd) > 0:
                 positive_psd = psd[psd > 0]
                 ymin = positive_psd.min() if len(positive_psd) else 1e-6
@@ -376,9 +419,7 @@ def page_signal_viewer():
                              alpha=0.85)
             ax2.grid(alpha=0.3, which="both")
             fig2.tight_layout()
-            with psd_area:
-                ui.pyplot(fig2)
-            plt.close(fig2)
+            _show_fig(psd_area, fig2)
 
         # ------------------------------------------------------------
         # Средние PSD (positive vs negative) + разница
@@ -435,46 +476,44 @@ def page_signal_viewer():
             f_neg, p_neg = f_neg[:n], p_neg[:n]
 
             _clear(avg_area)
-            with avg_area:
-                # --- Средние PSD ---
-                fig, ax = plt.subplots(figsize=(11, 4.5))
-                ax.semilogy(f_pos, p_pos, color="#2ecc71",
-                            linewidth=1.8,
-                            label=f"Positive (n={len(segs_pos)})")
-                ax.semilogy(f_neg, p_neg, color="#e74c3c",
-                            linewidth=1.8,
-                            label=f"Negative (n={len(segs_neg)})")
-                ax.set_xlim(0.5, 45)
-                ax.set_xlabel("Частота, Гц")
-                ax.set_ylabel("Средний PSD, мкВ²/Гц (log)")
-                ax.set_title(
-                    f"Средние спектры: positive vs negative ({ch})")
-                ax.legend()
-                ax.grid(alpha=0.3, which="both")
-                fig.tight_layout()
-                ui.pyplot(fig)
-                plt.close(fig)
 
-                # --- Разница ---
-                fig2, ax2 = plt.subplots(figsize=(11, 3))
-                ratio = np.log10(p_pos / np.maximum(p_neg, 1e-12))
-                ax2.axhline(y=0, color="gray",
-                            linestyle="--", alpha=0.6)
-                ax2.plot(f_pos, ratio,
-                         color="#8e44ad", linewidth=1.5)
-                for name, (lo, hi) in BANDS.items():
-                    ax2.axvspan(lo, hi, alpha=0.1,
-                                color=BAND_COLORS[name])
-                ax2.set_xlim(0.5, 45)
-                ax2.set_xlabel("Частота, Гц")
-                ax2.set_ylabel("log10(pos / neg)")
-                ax2.set_title(
-                    "Разница спектров (>0 = выше при апноэ, "
-                    "<0 = ниже при апноэ)")
-                ax2.grid(alpha=0.3)
-                fig2.tight_layout()
-                ui.pyplot(fig2)
-                plt.close(fig2)
+            # --- Средние PSD ---
+            fig, ax = plt.subplots(figsize=(11, 4.5))
+            ax.semilogy(f_pos, p_pos, color="#2ecc71",
+                        linewidth=1.8,
+                        label=f"Positive (n={len(segs_pos)})")
+            ax.semilogy(f_neg, p_neg, color="#e74c3c",
+                        linewidth=1.8,
+                        label=f"Negative (n={len(segs_neg)})")
+            ax.set_xlim(0.5, 45)
+            ax.set_xlabel("Частота, Гц")
+            ax.set_ylabel("Средний PSD, мкВ²/Гц (log)")
+            ax.set_title(
+                f"Средние спектры: positive vs negative ({ch})")
+            ax.legend()
+            ax.grid(alpha=0.3, which="both")
+            fig.tight_layout()
+            _show_fig(avg_area, fig)
+
+            # --- Разница ---
+            fig2, ax2 = plt.subplots(figsize=(11, 3))
+            ratio = np.log10(p_pos / np.maximum(p_neg, 1e-12))
+            ax2.axhline(y=0, color="gray",
+                        linestyle="--", alpha=0.6)
+            ax2.plot(f_pos, ratio,
+                     color="#8e44ad", linewidth=1.5)
+            for name, (lo, hi) in BANDS.items():
+                ax2.axvspan(lo, hi, alpha=0.1,
+                            color=BAND_COLORS[name])
+            ax2.set_xlim(0.5, 45)
+            ax2.set_xlabel("Частота, Гц")
+            ax2.set_ylabel("log10(pos / neg)")
+            ax2.set_title(
+                "Разница спектров (>0 = выше при апноэ, "
+                "<0 = ниже при апноэ)")
+            ax2.grid(alpha=0.3)
+            fig2.tight_layout()
+            _show_fig(avg_area, fig2)
 
         # ------------------------------------------------------------
         # Переключение исследования/канала
