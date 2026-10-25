@@ -42,7 +42,7 @@ DEFAULT_RANDOM_STATE = 42
 
 @dataclass
 class AppConfig:
-    api_url: str = "https://med.smed96.synology.me/psgapp/api/"
+    api_url: str = "https://medllm.ru/psgapp/api/"
     token: str = ""
     cache_dir: Path = field(default_factory=lambda: Path("./data"))
     max_speed_mbps: float = 2.0

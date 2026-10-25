@@ -1,18 +1,13 @@
 """
-Извлечение ЭЭГ-признаков из EDF для скользящих суб-эпох заданной длины.
+Извлечение ЭЭГ-признаков из EDF для скользящих суб-эпох.
 
-Признаки (на канал):
-  - Статистика: mean, std, min, max, range, rms
-  - Абсолютная мощность диапазонов (Welch): delta, theta, alpha, sigma, beta, gamma
-  - Относительная мощность тех же диапазонов
-  - TBR, DAR, SE50
-
-Оптимизировано для скорости: никаких SampEn, DFA, когерентности.
+Стадии и респираторные события читаются ПРЯМО ИЗ EDF (raw.annotations).
+fallback: hypnogram_data и phasic_events из API/БД (если в EDF ничего нет).
 """
 from __future__ import annotations
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -24,11 +19,11 @@ logger = logging.getLogger(__name__)
 
 try:
     import mne
-    mne.set_log_level("WARNING")
+    mne.set_log_level("ERROR")
     MNE_AVAILABLE = True
 except ImportError:
     MNE_AVAILABLE = False
-    logger.warning("MNE not installed")
+    logger.error("MNE not installed")
 
 from core.config import (
     BANDS, STANDARD_CHANNELS, TARGET_SR, LOWCUT, HIGHCUT,
@@ -36,13 +31,18 @@ from core.config import (
     DEFAULT_BUFFER_SEC,
 )
 from core.labeling import label_subepoch
+from core.edf_annotations import (
+    read_edf_with_fallback,
+    build_hypnogram_from_edf,
+    extract_respiratory_events,
+    extract_artifact_regions,
+    describe_annotations,
+)
 
 
-# -----------------------------------------------------------------------------
-# Вспомогательные
-# -----------------------------------------------------------------------------
-def _parse_hypnogram(raw) -> Optional[dict]:
-    """JSON из sleep_statistics.hypnogram_data → {'epoch_dur', 'stages'}."""
+# ---------------------------------------------------------------- helpers
+def _parse_hypnogram_db(raw) -> Optional[dict]:
+    """Fallback-парсер JSON из sleep_statistics.hypnogram_data."""
     if not raw:
         return None
     try:
@@ -50,11 +50,12 @@ def _parse_hypnogram(raw) -> Optional[dict]:
         stages = [STAGE_NORMALIZE.get(str(s), "UNKNOWN") for s in h["s"]]
         return {"epoch_dur": float(h["d"]), "stages": stages}
     except (json.JSONDecodeError, KeyError, TypeError) as e:
-        logger.warning(f"Bad hypnogram: {e}")
+        logger.warning(f"Bad hypnogram from DB: {e}")
         return None
 
 
-def _majority_stage(start: float, end: float, hypnogram: Optional[dict]) -> Optional[str]:
+def _majority_stage(start: float, end: float,
+                    hypnogram: Optional[dict]) -> Optional[str]:
     if not hypnogram:
         return None
     d = hypnogram["epoch_dur"]
@@ -86,13 +87,11 @@ def _se50(freqs: np.ndarray, psd: np.ndarray) -> float:
 
 
 def _resolve_channel(raw, target: str) -> Optional[str]:
-    """'F3' → 'EEG F3-A2' и т.п."""
     if target in raw.ch_names:
         return target
     target_u = target.upper()
     for name in raw.ch_names:
-        cleaned = (name.upper()
-                   .replace("EEG", "")
+        cleaned = (name.upper().replace("EEG", "")
                    .replace("-A1", "").replace("-A2", "")
                    .replace("-M1", "").replace("-M2", "")
                    .strip())
@@ -106,14 +105,20 @@ class ExtractedStudy:
     study_id: int
     patient_id: int
     df: pd.DataFrame
-    n_epochs_total: int
-    n_epochs_n2n3: int
-    n_epochs_labeled: int
+    n_epochs_total: int = 0
+    n_epochs_n2n3: int = 0
+    n_epochs_labeled: int = 0
+    stages_source: str = ""
+    events_source: str = ""
+    stage_counts: dict = field(default_factory=dict)
+    n_events_edf: int = 0
+    n_events_api: int = 0
+    n_artifacts: int = 0
+    annotation_counts: dict = field(default_factory=dict)
+    encoding: Optional[str] = None
 
 
-# -----------------------------------------------------------------------------
-# Основной экстрактор
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------- extractor
 class FeatureExtractor:
     def __init__(self, epoch_length: float, stride: Optional[float] = None,
                  buffer_sec: float = DEFAULT_BUFFER_SEC, t_pos: float = 0.5,
@@ -125,29 +130,101 @@ class FeatureExtractor:
         self.channels = channels or STANDARD_CHANNELS
 
     def extract(self, edf_path: Path, study_id: int, patient_id: int,
-                events: List[Tuple[float, float]],
-                hypnogram_raw) -> ExtractedStudy:
+                events_from_api: Optional[List[Tuple[float, float]]] = None,
+                hypnogram_from_db=None) -> ExtractedStudy:
         if not MNE_AVAILABLE:
             raise RuntimeError("MNE not installed")
 
-        raw = self._prepare(edf_path)
-        hypnogram = _parse_hypnogram(hypnogram_raw)
+        # 1. Читаем EDF
+        raw, enc = read_edf_with_fallback(edf_path)
+        ann_counts = describe_annotations(raw)
+        duration = raw.n_times / raw.info["sfreq"]
+        logger.info(
+            f"Study {study_id}: EDF loaded (enc={enc}, dur={duration:.0f}s, "
+            f"ch={len(raw.ch_names)}), annotations={ann_counts}"
+        )
+
+        # 2. Стадии из EDF
+        hyp_edf = build_hypnogram_from_edf(raw)
+        stage_counts: dict = {}
+        stages_source = ""
+        if hyp_edf:
+            for s in hyp_edf["stages"]:
+                stage_counts[s] = stage_counts.get(s, 0) + 1
+            has_n2n3 = any(s in ("N2", "N3") for s in stage_counts)
+            if has_n2n3:
+                hypnogram = hyp_edf
+                stages_source = "EDF"
+            else:
+                hypnogram = hyp_edf
+                stages_source = "EDF (no N2/N3)"
+        else:
+            hypnogram = None
+            stages_source = ""
+
+        # Fallback: hypnogram_data из БД
+        if not hypnogram or "N2" not in stage_counts and "N3" not in stage_counts:
+            if hypnogram_from_db:
+                hyp_db = _parse_hypnogram_db(hypnogram_from_db)
+                if hyp_db:
+                    stage_counts = {}
+                    for s in hyp_db["stages"]:
+                        stage_counts[s] = stage_counts.get(s, 0) + 1
+                    hypnogram = hyp_db
+                    stages_source = "DB"
+
+        if not hypnogram or not hypnogram["stages"]:
+            raise ValueError(
+                f"Study {study_id}: нет стадий ни в EDF, ни в БД. "
+                f"Annotations: {ann_counts}"
+            )
+
+        logger.info(
+            f"Study {study_id}: stages={stages_source}, "
+            f"dist={stage_counts}"
+        )
+
+        # 3. События из EDF (приоритет)
+        events_edf = extract_respiratory_events(raw)
+        if events_edf:
+            events = events_edf
+            events_source = "EDF"
+        elif events_from_api:
+            events = events_from_api
+            events_source = "API"
+        else:
+            events = []
+            events_source = "none"
+        logger.info(
+            f"Study {study_id}: events={events_source}, "
+            f"EDF={len(events_edf)}, API={len(events_from_api or [])}"
+        )
+
+        # 4. Артефакты
+        artifacts = extract_artifact_regions(raw)
+        logger.info(f"Study {study_id}: artifacts={len(artifacts)}")
+
+        # 5. Фильтрация и референс (ПОСЛЕ аннотаций)
+        raw = self._prepare(raw)
         sfreq = float(raw.info["sfreq"])
         duration = raw.n_times / sfreq
 
-        # Кэш numpy-массивов по каналам
+        # 6. Данные по каналам
         ch_data = {}
         for ch in self.channels:
             actual = _resolve_channel(raw, ch)
             if actual:
                 ch_data[ch] = raw.get_data(picks=actual)[0]
             else:
-                logger.warning(f"Study {study_id}: channel '{ch}' not found "
-                               f"(available: {raw.ch_names[:8]}...)")
-
+                logger.warning(f"Study {study_id}: ch '{ch}' not found "
+                               f"(available: {raw.ch_names[:8]})")
         if not ch_data:
-            raise ValueError(f"Study {study_id}: no usable EEG channels found")
+            raise ValueError(
+                f"Study {study_id}: no EEG channels. "
+                f"Available: {raw.ch_names}"
+            )
 
+        # 7. Скользящее окно
         rows = []
         n_total = n_n2n3 = 0
         t = 0.0
@@ -161,8 +238,11 @@ class FeatureExtractor:
                 continue
             n_n2n3 += 1
 
-            lab = label_subepoch(ep_start, ep_end, events,
-                                 t_pos=self.t_pos, buffer_sec=self.buffer_sec)
+            lab = label_subepoch(
+                ep_start, ep_end, events,
+                t_pos=self.t_pos, buffer_sec=self.buffer_sec,
+                artifacts=artifacts,
+            )
 
             start_idx = int(ep_start * sfreq)
             end_idx = int(ep_end * sfreq)
@@ -184,31 +264,45 @@ class FeatureExtractor:
             t += self.stride
 
         return ExtractedStudy(
-            study_id=study_id, patient_id=patient_id,
+            study_id=study_id,
+            patient_id=patient_id,
             df=pd.DataFrame(rows),
-            n_epochs_total=n_total, n_epochs_n2n3=n_n2n3,
+            n_epochs_total=n_total,
+            n_epochs_n2n3=n_n2n3,
             n_epochs_labeled=len(rows),
+            stages_source=stages_source,
+            events_source=events_source,
+            stage_counts=stage_counts,
+            n_events_edf=len(events_edf),
+            n_events_api=len(events_from_api or []),
+            n_artifacts=len(artifacts),
+            annotation_counts=ann_counts,
+            encoding=enc,
         )
 
-    def _prepare(self, edf_path: Path):
-        raw = mne.io.read_raw_edf(str(edf_path), preload=True, verbose="WARNING")
+    def _prepare(self, raw):
         if abs(raw.info["sfreq"] - TARGET_SR) > 1:
-            raw.resample(TARGET_SR, verbose="WARNING")
-        raw.filter(LOWCUT, HIGHCUT, method="filtfilt", verbose="WARNING")
+            raw.resample(TARGET_SR, verbose="ERROR")
+
+        iir_params = dict(order=4, ftype="butter", output="sos")
+        raw.filter(LOWCUT, HIGHCUT,
+                   method="iir", iir_params=iir_params,
+                   phase="zero", verbose="ERROR")
+
         if USE_AVERAGE_REFERENCE:
-            eeg_channels = [c for c in (_resolve_channel(raw, ch) for ch in self.channels) if c]
-            if len(eeg_channels) > 1:
-                raw.set_eeg_reference(eeg_channels, projection=False, verbose="WARNING")
+            eeg = [c for c in (_resolve_channel(raw, ch) for ch in self.channels) if c]
+            if len(eeg) > 1:
+                raw.set_eeg_reference(eeg, projection=False, verbose="ERROR")
         return raw
 
     def _channel_features(self, segment: np.ndarray, sfreq: float, ch: str) -> dict:
         seg_uv = segment * 1e6
         out = {
-            f"{ch}_mean":  float(np.mean(seg_uv)),
-            f"{ch}_std":   float(np.std(seg_uv)),
-            f"{ch}_min":   float(np.min(seg_uv)),
-            f"{ch}_max":   float(np.max(seg_uv)),
-            f"{ch}_rms":   float(np.sqrt(np.mean(seg_uv ** 2))),
+            f"{ch}_mean": float(np.mean(seg_uv)),
+            f"{ch}_std":  float(np.std(seg_uv)),
+            f"{ch}_min":  float(np.min(seg_uv)),
+            f"{ch}_max":  float(np.max(seg_uv)),
+            f"{ch}_rms":  float(np.sqrt(np.mean(seg_uv ** 2))),
         }
         out[f"{ch}_range"] = out[f"{ch}_max"] - out[f"{ch}_min"]
 

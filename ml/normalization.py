@@ -1,4 +1,11 @@
-"""Normalizer: fit on train, transform train/test без утечки."""
+"""Normalizer: fit on train, transform train/test.
+
+Для patient-z используется трансдуктивный подход: для КАЖДОГО пациента
+(включая test) μ/σ считаются по его собственным тоническим эпохам.
+Это НЕ утечка меток (используем только сигнал, не label) и корректно
+воспроизводит deployment: для нового пациента в клинике тоже есть
+только его собственный сигнал.
+"""
 from __future__ import annotations
 import numpy as np
 import pandas as pd
@@ -6,7 +13,7 @@ import pandas as pd
 META_COLS = {
     "study_id", "patient_id", "epoch_start", "epoch_len", "epoch_stage",
     "label", "overlap_fraction", "n_events", "has_event_onset",
-    "has_event_offset", "is_tonic", "ahi",
+    "has_event_offset", "is_tonic", "artifact_overlap_sec", "ahi",
     "cvd_hypertension", "endocrine_diabetes", "som_insomnia", "cvd_ihd",
 }
 
@@ -17,64 +24,70 @@ def identify_feature_columns(df: pd.DataFrame) -> list:
 
 
 class Normalizer:
-    """'none' | 'global' | 'patient' — с fit() на train-наборе."""
+    """'none' | 'global' | 'patient'.
+
+    - none: без изменений.
+    - global: z-score по train-тоническим, применяется ко всем одинаково.
+    - patient: per-patient z-score. Для КАЖДОГО пациента (train и test)
+      μ/σ берутся из его тонических эпох. Если тонических < MIN_TONIC
+      — fallback на глобальные μ/σ (для train и test одинаково).
+    """
+
+    MIN_TONIC = 20  # минимум тонических эпох для надёжной per-patient нормы
 
     def __init__(self, method: str = "patient"):
         self.method = method
-        self._stats = None
+        self._global_stats = None
 
     def fit(self, df_train: pd.DataFrame, feature_cols: list) -> "Normalizer":
         if self.method == "none":
             return self
 
-        # Baseline = тонические эпохи (без событий)
-        tonic = df_train[df_train.get("is_tonic", 1) == 1] if "is_tonic" in df_train else df_train
+        tonic = (df_train[df_train["is_tonic"] == 1]
+                 if "is_tonic" in df_train.columns else df_train)
         if tonic.empty:
             tonic = df_train
 
-        if self.method == "global":
-            self._stats = {
-                "mean": tonic[feature_cols].mean(),
-                "std": tonic[feature_cols].std().replace(0, 1),
-            }
-        elif self.method == "patient":
-            g = tonic.groupby("patient_id")[feature_cols]
-            per_patient = g.agg(["mean", "std"])
-            per_patient.columns = [f"{c}_{s}" for c, s in per_patient.columns]
-            self._stats = {
-                "per_patient": per_patient,
-                "global_mean": tonic[feature_cols].mean().values,
-                "global_std": tonic[feature_cols].std().replace(0, 1).values,
-            }
-        else:
-            raise ValueError(f"Unknown method: {self.method}")
+        self._global_stats = {
+            "mean": tonic[feature_cols].mean().values,
+            "std": tonic[feature_cols].std().replace(0, 1).values,
+        }
         return self
 
     def transform(self, df: pd.DataFrame, feature_cols: list) -> pd.DataFrame:
-        if self.method == "none" or self._stats is None:
+        if self.method == "none" or self._global_stats is None:
             return df.copy()
         df = df.copy()
 
         if self.method == "global":
-            df[feature_cols] = (df[feature_cols] - self._stats["mean"]) / self._stats["std"]
+            df[feature_cols] = (
+                (df[feature_cols].values - self._global_stats["mean"])
+                / self._global_stats["std"]
+            )
             return df
 
-        # per-patient
-        per_patient = self._stats["per_patient"]
-        g_mean = self._stats["global_mean"]
-        g_std = self._stats["global_std"]
+        # patient — для КАЖДОГО пациента отдельно
+        X = df[feature_cols].values.astype(float)
+        g_mean = self._global_stats["mean"]
+        g_std = self._global_stats["std"]
 
-        means = per_patient[[f"{c}_mean" for c in feature_cols]].copy()
-        means.columns = feature_cols
-        stds = per_patient[[f"{c}_std" for c in feature_cols]].replace(0, 1).copy()
-        stds.columns = feature_cols
-
-        X = df[feature_cols].values.copy()
         for pid, idx in df.groupby("patient_id").groups.items():
-            if pid in means.index:
-                m, s = means.loc[pid].values, stds.loc[pid].values
+            idx = np.asarray(idx, dtype=int)
+            if "is_tonic" in df.columns:
+                tonic_mask = df.iloc[idx]["is_tonic"].values == 1
+                baseline_idx = idx[tonic_mask]
+            else:
+                baseline_idx = idx
+            if len(baseline_idx) < self.MIN_TONIC:
+                baseline_idx = idx  # fallback: все эпохи пациента
+
+            if len(baseline_idx) >= 2:
+                m = np.nanmean(X[baseline_idx], axis=0)
+                s = np.nanstd(X[baseline_idx], axis=0)
+                s = np.where(s == 0, 1.0, s)
             else:
                 m, s = g_mean, g_std
             X[idx] = (X[idx] - m) / s
+
         df[feature_cols] = X
         return df
